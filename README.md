@@ -1,14 +1,18 @@
-# lumi-supervisor
+# Supervisor
 
-Monitors the path deployed by the deployer and requests recalculation when the optimal path changes.
+Monitors QoS KPIs from path deployed by the deployer and requests recalculation when a drift occurs.
 
 ## Behavior
 
-1. The deployer POSTs the calculated path and solver parameters to `/supervise`
-2. The supervisor stores the path as the current baseline and starts a 10-second monitor loop
-3. Every 10s, the supervisor re-runs the CdN-QoE solver with the same parameters
-4. If the new optimal path differs from the current one, the supervisor POSTs `{ recalculate: true }` back to the deployer
-5. After a recalculate request, the loop pauses until the deployer sends a new path
+1. The deployer POSTs the calculated path and access delay to `/supervise`
+2. The supervisor stores the path as the current baseline and starts a 5-second monitor loop
+3. Every 5s, the supervisor measures end-to-end delay by summing per-edge RTTs from the ONOS link-latencies app (plus `2 × access_delay_ms` for client/server access links) and computes a moving-average throughput from the server-facing port statistics on ES (`of:0000000000000001`, port 3)
+4. After a recalculate request, the loop pauses until the deployer sends a new path via `/supervise`
+
+
+## Where to add new drift rules?
+
+Drift criteria are defined inside `/app/services.py`, within the private method `_monitor_cycle`.
 
 ## Endpoints
 
@@ -21,12 +25,15 @@ Monitors the path deployed by the deployer and requests recalculation when the o
 
 ```json
 {
-    "path":       [[0, 2], [2, 3]],
-    "source_uf":  "SP",
-    "target_ufs": ["ES"],
-    "tx":         [500.0]
+    "path":            [[0, 2], [2, 3]],
+    "access_delay_ms": 0.0
 }
 ```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `path` | `list[list[int, int]]` | Yes | Ordered list of edges `[i, j]` representing the deployed path (node indices into `ESTADOS`) |
+| `access_delay_ms` | `float` | No | One-way access-link delay in ms (default `0.0`). Added twice to the total delay to account for client-side and server-side access links |
 
 ## Running
 
@@ -37,7 +44,7 @@ pip install -r requirements.txt
 python -m flask --app app.routes run --port 5151
 ```
 
-**Docker**
+**Docker** 
 ```bash
 sudo docker build -t supervisor .
 sudo docker run --rm -it --network host -v /var/run/docker.sock:/var/run/docker.sock --name supervisor supervisor
