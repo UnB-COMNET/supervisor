@@ -7,13 +7,11 @@ import time
 
 import requests
 
-from app import cdn_qoe
+from app import cdn_qoe, quantization
 
 logger = logging.getLogger(__name__)
 
-MONITOR_INTERVAL = 5 # seconds
-DELAY_THRESHOLD_MS = 100.0 # midpoint between normal (~40ms) and degraded (~125ms)
-THROUGHPUT_THRESHOLD_BPS = 125e6 # 125 Mbit/s
+MONITOR_INTERVAL = 7 # seconds
 THROUGHPUT_WINDOW = 5 # number of samples for the moving average
 
 
@@ -74,20 +72,21 @@ class SupervisorService:
                 delay_ms, throughput_avg_bps / 1e6, len(self._throughput_samples),
             )
 
-            if delay_ms > DELAY_THRESHOLD_MS:
-                logger.warning(
-                    "*** Delay %.1f ms > %.0f ms threshold -> recalculate ***",
-                    delay_ms, DELAY_THRESHOLD_MS,
-                )
-                self._notify_deployer_recalculate()
-                return # deployer will call /supervise again with the new path
+            kpis = {"delay_ms": delay_ms}
+            if len(self._throughput_samples) == THROUGHPUT_WINDOW:
+                kpis["throughput_mbps"] = throughput_avg_bps / 1e6
 
-            if (len(self._throughput_samples) == THROUGHPUT_WINDOW
-                    and throughput_avg_bps < THROUGHPUT_THRESHOLD_BPS):
-                logger.warning(
-                    "*** Throughput avg %.2f Mbit/s < %.0f Mbit/s threshold -> recalculate ***",
-                    throughput_avg_bps / 1e6, THROUGHPUT_THRESHOLD_BPS / 1e6,
-                )
+            report = quantization.compute_drift(kpis)
+            for kpi, (p9, p3, label) in report.kpi_states.items():
+                logger.info("  KPI %-20s = %7.2f  P9=%+d  P3=%+d (%s)", kpi, kpis[kpi], p9, p3, label)
+            logger.info(
+                "  health=min(P3)=%+d (%s)  dist=%.3f  grad=%s",
+                report.health, report.health_label, report.distance,
+                {k: f"{v:+.2f}" for k, v in report.gradient.items()},
+            )
+
+            if report.health == -1:
+                logger.warning("*** Critical KPI drift (health=%+d) -> recalculate ***", report.health)
                 self._notify_deployer_recalculate()
                 return # deployer will call /supervise again with the new path
 
@@ -119,7 +118,7 @@ class SupervisorService:
     #   - Computes instantaneous throughput, appends to a sliding window, returns the window average.
     def _measure_path_throughput(self) -> float:
         device_id = cdn_qoe.DEVICE_MAP["ES"]
-        url  = f"{self.onos_base_url}/statistics/ports/{device_id}"
+        url = f"{self.onos_base_url}/statistics/ports/{device_id}"
         auth = ("onos", "rocks")
 
         try:
@@ -147,7 +146,8 @@ class SupervisorService:
             self._last_bytes_time = t2
 
             self._throughput_samples.append(bps)
-            return sum(self._throughput_samples) / len(self._throughput_samples)
+            active = [s for s in self._throughput_samples if s > 0]
+            return sum(active) / len(active) if active else 0.0
 
         except Exception as e:
             logger.error("Throughput measure error: %s", e)
