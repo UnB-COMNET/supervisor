@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 MONITOR_INTERVAL = 5 # seconds
 DELAY_THRESHOLD_MS = 100.0 # midpoint between normal (~40ms) and degraded (~125ms)
-THROUGHPUT_THRESHOLD_BPS = 125e6 # 125 Mbit/s
+THROUGHPUT_THRESHOLD_BPS = 25e6 # 25 Mbit/s
 THROUGHPUT_WINDOW = 5 # number of samples for the moving average
 
 
