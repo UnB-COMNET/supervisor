@@ -7,14 +7,12 @@ import time
 
 import requests
 
-from app import cdn_qoe
+from app import cdn_qoe, quantization
 import app.metrics as _metrics
 
 logger = logging.getLogger(__name__)
 
 MONITOR_INTERVAL = 5 # seconds
-DELAY_THRESHOLD_MS = 100.0 
-THROUGHPUT_THRESHOLD_BPS = 25e6 # 25 Mbit/s
 THROUGHPUT_WINDOW = 5 # number of samples for the moving average
 
 class SupervisorService:
@@ -59,8 +57,8 @@ class SupervisorService:
         self._timer.daemon = True
         self._timer.start()
 
-    # Brief: Every MONITOR_INTERVAL seconds: measures delay and throughput (moving avg)
-    # Triggers recalculate if delay > DELAY_THRESHOLD_MS or throughput avg < THROUGHPUT_THRESHOLD_BPS
+    # Brief: Every MONITOR_INTERVAL seconds: measures delay and throughput (moving avg),
+    # quantizes each KPI (P9 → P3) and triggers recalculate when overall health is Critical.
     def _monitor_cycle(self):
         with self._lock:
             if self._path is None:
@@ -74,29 +72,36 @@ class SupervisorService:
             delay_ms = self._measure_path_delay(current_path, access_delay_ms, path_estados)
             throughput_avg_bps = self._measure_path_throughput(server_uf)
 
+            throughput_mbps = throughput_avg_bps / 1e6
             logger.info(
                 "delay=%.1f ms | throughput_avg=%.2f Mbit/s (window=%d)",
-                delay_ms, throughput_avg_bps / 1e6, len(self._throughput_samples),
+                delay_ms, throughput_mbps, len(self._throughput_samples),
             )
 
-            if delay_ms > DELAY_THRESHOLD_MS:
-                logger.warning(
-                    "*** Delay %.1f ms > %.0f ms threshold -> recalculate ***",
-                    delay_ms, DELAY_THRESHOLD_MS,
-                )
-                degrade_ts = _metrics.get_value("degrade_ts")
-                if degrade_ts is not None and _metrics.get_value("detection_time_s") is None:
-                    _metrics.set_value("detection_time_s", time.time() - degrade_ts)
-                _metrics.increment("drift_detected")
-                self._notify_deployer_recalculate()
-                return # deployer will call /supervise again with the new path
+            kpis = {"RTT_ms": delay_ms}
+            if len(self._throughput_samples) == THROUGHPUT_WINDOW:
+                kpis["Vazao_Mbps"] = throughput_mbps
 
-            if (len(self._throughput_samples) == THROUGHPUT_WINDOW
-                    and throughput_avg_bps < THROUGHPUT_THRESHOLD_BPS):
-                logger.warning(
-                    "*** Throughput avg %.2f Mbit/s < %.0f Mbit/s threshold -> recalculate ***",
-                    throughput_avg_bps / 1e6, THROUGHPUT_THRESHOLD_BPS / 1e6,
+            overall, details = quantization.evaluate_service_health(kpis)
+
+            for kpi_name, r in details.items():
+                logger.info(
+                    "KPI %-12s = %7.2f %s  →  P9=%+d (%s)  →  P3=%+d (%s)",
+                    kpi_name, r.value,
+                    quantization.POLICIES[kpi_name]["unit"],
+                    r.p9, r.p9_label, r.p3, r.p3_label,
                 )
+
+            drifted = [
+                f"{n}={r.value:.2f} P9={r.p9:+d} ({r.p9_label})"
+                for n, r in details.items() if r.p3 < 1
+            ]
+
+            if overall == 0:
+                logger.warning("Service health WARNING - drift: %s", ", ".join(drifted))
+
+            if overall == -1:
+                logger.warning("*** Service health CRITICAL - drift: %s → recalculate ***", ", ".join(drifted))
                 degrade_ts = _metrics.get_value("degrade_ts")
                 if degrade_ts is not None and _metrics.get_value("detection_time_s") is None:
                     _metrics.set_value("detection_time_s", time.time() - degrade_ts)
@@ -143,7 +148,7 @@ class SupervisorService:
     #   - Computes instantaneous throughput, appends to a sliding window, returns the window average
     def _measure_path_throughput(self, server_uf: str = None) -> float:
         if not server_uf or server_uf not in cdn_qoe.DEVICE_MAP:
-            logger.warning("server_uf '%s' not in DEVICE_MAP — skipping throughput", server_uf)
+            logger.warning("server_uf '%s' not in DEVICE_MAP - skipping throughput", server_uf)
             return 0.0
         device_id = cdn_qoe.DEVICE_MAP[server_uf]
         url  = f"{self.onos_base_url}/statistics/ports/{device_id}"
