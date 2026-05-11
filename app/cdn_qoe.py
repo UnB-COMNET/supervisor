@@ -1,11 +1,14 @@
 """ CdN-QoE latency discovery for the supervisor """
 
+import logging
 import os
 import re
 import subprocess
 from typing import Optional
 
 import requests as _req
+
+logger = logging.getLogger(__name__)
 
 ESTADOS: list    = []
 DEVICE_MAP: dict = {}
@@ -16,15 +19,21 @@ def _mgmt_ip_to_container(mgmt_ip: str) -> Optional[str]:
     try:
         out = subprocess.check_output(
             "docker inspect --format '{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' $(docker ps -q)",
-            shell=True, stderr=subprocess.DEVNULL,
+            shell=True, stderr=subprocess.STDOUT,
         ).decode()
         for line in out.strip().splitlines():
             parts = line.strip().split()
             name = parts[0].lstrip("/")
             if mgmt_ip in parts[1:]:
                 return name
-    except Exception:
-        pass
+        logger.debug("_mgmt_ip_to_container: IP %s not found among running containers", mgmt_ip)
+    except subprocess.CalledProcessError as e:
+        logger.error(
+            "_mgmt_ip_to_container: docker command failed (is /var/run/docker.sock mounted?)\n  cmd output: %s",
+            e.output.decode(errors="replace").strip(),
+        )
+    except Exception as e:
+        logger.error("_mgmt_ip_to_container: unexpected error: %s", e)
     return None
 
 
@@ -33,21 +42,37 @@ def _discover_device_map() -> dict:
     auth = (os.environ.get("ONOSUSER", "karaf"), os.environ.get("ONOSPASS", "karaf"))
     resp = _req.get(f"{onos_url}/onos/v1/devices", auth=auth, timeout=5)
     resp.raise_for_status()
+
+    devices = resp.json().get("devices", [])
+    logger.info("_discover_device_map: ONOS returned %d device(s)", len(devices))
+
     device_map = {}
-    for dev in resp.json().get("devices", []):
-        mgmt_ip  = dev.get("annotations", {}).get("managementAddress", "")
+    for dev in devices:
+        dev_id  = dev["id"]
+        mgmt_ip = dev.get("annotations", {}).get("managementAddress", "")
         container = _mgmt_ip_to_container(mgmt_ip)
         if not container:
+            logger.warning("_discover_device_map: skipping %s (mgmt_ip=%s) — no matching container found", dev_id, mgmt_ip)
             continue
         try:
             desc = subprocess.check_output(
                 f"docker exec {container} ovs-vsctl get bridge {container} other-config:dp-desc",
-                shell=True, stderr=subprocess.DEVNULL,
+                shell=True, stderr=subprocess.STDOUT,
             ).decode().strip()
             if desc:
-                device_map[desc] = dev["id"]
-        except Exception:
-            pass
+                device_map[desc] = dev_id
+                logger.debug("_discover_device_map: mapped %s -> %s (container=%s)", desc, dev_id, container)
+            else:
+                logger.warning("_discover_device_map: container %s returned empty dp-desc for %s", container, dev_id)
+        except subprocess.CalledProcessError as e:
+            logger.error(
+                "_discover_device_map: ovs-vsctl failed on container %s for device %s\n  cmd output: %s",
+                container, dev_id, e.output.decode(errors="replace").strip(),
+            )
+        except Exception as e:
+            logger.error("_discover_device_map: unexpected error for device %s: %s", dev_id, e)
+
+    logger.info("_discover_device_map: built map with %d entry(ies): %s", len(device_map), list(device_map.keys()))
     return device_map
 
 
@@ -57,7 +82,7 @@ def get_dynamic_latencies():
 
     device_map = _discover_device_map()
     if not device_map:
-        raise RuntimeError("[CdN-QoE] ONOS returned no devices — topology unavailable")
+        raise RuntimeError("[CdN-QoE] ONOS returned no devices - topology unavailable")
 
     estados   = list(device_map.keys())
     rtt_matrix = [[0.0 for _ in estados] for _ in estados]
@@ -89,7 +114,7 @@ def get_dynamic_latencies():
                 rtt_matrix[estados.index(src_st)][estados.index(dst_st)] = float(m.group(3))
 
     except Exception as e:
-        print(f"[CdN-QoE] Failed to read link latencies: {e}")
+        logger.error("get_dynamic_latencies: failed to read link latencies: %s", e)
 
     ESTADOS    = estados
     DEVICE_MAP = device_map
